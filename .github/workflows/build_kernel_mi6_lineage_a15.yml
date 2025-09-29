@@ -1,0 +1,152 @@
+name: 编译内核
+
+on:
+  push:
+    paths:
+      - 'arch/**'
+      - 'drivers/**'
+      - 'kernel/**'
+      - 'Makefile'
+  workflow_dispatch:  
+env:
+  AOSP_TOOLCHAIN_BRANCH: android15
+  AOSP_CLANG_VERSION: r522817
+  KERNEL_LOCALVERSION: Sakurilight
+
+jobs:
+  build:
+    name: 编译内核
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        device: [sagit]
+    steps:
+      - name: 安装依赖
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            binutils-arm-linux-gnueabi \
+            binutils-aarch64-linux-gnu \
+            gcc-aarch64-linux-gnu \
+            gcc-arm-linux-gnueabi \
+            libelf-dev \
+            libssl-dev \
+            ccache \
+            bc bison flex zip
+
+      - name: 同步仓库
+        uses: actions/checkout@v4
+        with:
+          path: kernel
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: 设置Clang缓存
+        id: cache-clang
+        uses: actions/cache@v4
+        with:
+          path: clang
+          key: clang-${{ env.AOSP_TOOLCHAIN_BRANCH }}-${{ env.AOSP_CLANG_VERSION }}
+
+      - name: 下载Clang工具链
+        if: steps.cache-clang.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p clang &&
+          curl -LSs --retry 3 --max-time 600 \
+            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/${{ env.AOSP_TOOLCHAIN_BRANCH }}-release/clang-${{ env.AOSP_CLANG_VERSION }}.tar.gz" | tar -xzf - -C clang --checkpoint=1000
+
+      - name: 设置ccache缓存
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: kernel-${{ matrix.device }}
+          restore-keys: kernel-${{ matrix.device }}
+          max-size: 10G
+
+      - name: 编译内核
+        working-directory: kernel
+        run: |
+          export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
+          make O=out LLVM=1 LLVM_IAS=1 ARCH=arm64 \
+               -j$(nproc) CC="ccache clang" \
+               CROSS_COMPILE=aarch64-linux-gnu- \
+               CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+               LOCALVERSION=-${{ env.KERNEL_LOCALVERSION }} \
+               sagit_defconfig all
+
+      - name: 准备AnyKernel3打包
+        run: |
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3 ak3
+          cp kernel/out/arch/arm64/boot/Image.gz-dtb ak3/
+          cat > ak3/anykernel.sh << 'EOF'
+          #!/bin/sh
+          properties() {
+            echo "kernel.string=Kernel for ${{ matrix.device }}"
+            echo "device.name1=${{ matrix.device }}"
+            echo "do.devicecheck=1"
+          }
+          ramdisk_compression=auto
+          patch_vbmeta_flag=auto
+          is_slot_device=auto
+          block=auto
+          . tools/ak3-core.sh
+          split_boot
+          flash_boot
+          EOF
+          cd ak3 && zip -qr9 Lineage22.2-SukiSU-${{ matrix.device }}.zip . -x ".git*" "README.md" "*placeholder"
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-${{ matrix.device }}
+          path: ak3/Lineage22.2-SukiSU-${{ matrix.device }}.zip
+          compression-level: 0  
+
+  release:
+    name: 发布版本
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: 获取构建产物
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: kernel-*
+          merge-multiple: true
+
+      - name: 获取提交信息
+        id: build-info
+        run: echo "commit_msg=$(git log -1 --pretty=format:%s ${{ github.sha }})" >> $GITHUB_OUTPUT
+
+      - name: 获取当前时间
+        id: get_beijing_time
+        run: |
+          # 切换时区为北京时间（Asia/Shanghai）
+          sudo timedatectl set-timezone Asia/Shanghai
+          # 输出多种时间格式，用不同变量名区分
+          echo "date=$(date +'%Y%m%d')" >> $GITHUB_OUTPUT                       # 格式：20240917（年月日）
+          echo "datetime=$(date +'%Y%m%d %H%M')" >> $GITHUB_OUTPUT              # 格式：20240917 1530（年月日 时分）
+          echo "full_datetime=$(date +'%Y-%m-%d %H:%M:%S')" >> $GITHUB_OUTPUT   # 格式：2024-09-17 15:30:00（完整时间）
+          echo "hour_min=$(date +'%H%M')" >> $GITHUB_OUTPUT                     # 格式：1530（时分，单独用）
+
+      - name: 创建发布
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ steps.get_beijing_time.outputs.date }}-${{ steps.get_beijing_time.outputs.hour_min }}
+          name: SukiSU ver. ${{ steps.get_beijing_time.outputs.date }}
+          body: |
+            ## 内核刷包信息
+            - 适配设备：Xiaomi Mi6（sagit）
+            - 内核信息：${{ env.KERNEL_LOCALVERSION }}
+            - 构建时间：${{ steps.get_beijing_time.outputs.full_datetime }}
+            - 触发提交：[${{ github.sha_short }}](${{ github.event.repository.html_url }}/commit/${{ github.sha }})
+            - 提交说明：${{ steps.build-info.outputs.commit_msg }}
+
+            ## 使用方法
+            1. 设备需解锁 Bootloader 并安装 TWRP Recovery
+            2. 下载刷包后，通过 TWRP 刷入
+            3. 刷入完成后重启设备即可生效
+          files: artifacts/Lineage22.2-SukiSU-*.zip
